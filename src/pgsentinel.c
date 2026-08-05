@@ -83,6 +83,7 @@ static void ash_shmem_request(void);
 static int ash_sampling_period = 1;
 static int ash_max_entries = 1000;
 static int pgssh_max_entries = 10000;
+static int pgssh_sampling_period = 1;
 static bool pgssh_enable = false;
 static bool ash_track_idle_trans = false;
 static int ash_restart_wait_time = 2;
@@ -899,6 +900,8 @@ pgsentinel_main(Datum main_arg)
 {
 	MemoryContext pgsentinel_loop_context;
 	MemoryContext saved_context;
+	TimestampTz last_ash_sample_time = 0;
+	TimestampTz last_pgssh_sample_time = 0;
 
 	ereport(LOG, (errmsg("starting bgworker pgsentinel")));
 
@@ -930,20 +933,34 @@ pgsentinel_main(Datum main_arg)
 	while (!got_sigterm)
 	{
 		int rc, ret;
+		long wait_timeout_ms;
 		uint64 i;
 		bool gotactives;
+		bool sample_ash;
 		TimestampTz ash_time;
+		TimestampTz next_ash_time;
+		TimestampTz next_pgssh_time;
 		gotactives=false; 
 
 letswait:
+		next_ash_time = last_ash_sample_time ?
+			last_ash_sample_time + ((TimestampTz) ash_sampling_period * USECS_PER_SEC) : 0;
+		next_pgssh_time = pgssh_enable ?
+			(last_pgssh_sample_time ?
+			 last_pgssh_sample_time + ((TimestampTz) pgssh_sampling_period * USECS_PER_SEC) : 0)
+			: next_ash_time;
+		wait_timeout_ms = (long) ((Min(next_ash_time, next_pgssh_time) - GetCurrentTimestamp() + 999) / 1000);
+		/* Small backoff to avoid a tight loop if the timeout is zero or negative. */
+		wait_timeout_ms = wait_timeout_ms < 10 ? 10 : wait_timeout_ms;
+
 		/* Wait necessary amount of time */
 #if PG_VERSION_NUM >= 100000
 		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-								ash_sampling_period * 1000L,PG_WAIT_EXTENSION);
+								wait_timeout_ms, PG_WAIT_EXTENSION);
 		ResetLatch(MyLatch);
 #else
 		rc = WaitLatch(&MyProc->procLatch, WL_LATCH_SET | WL_TIMEOUT |
-							WL_POSTMASTER_DEATH, ash_sampling_period * 1000L);
+							WL_POSTMASTER_DEATH, wait_timeout_ms);
 		ResetLatch(&MyProc->procLatch);
 #endif
 
@@ -1001,46 +1018,52 @@ letswait:
 			elog(FATAL, "cannot select from pg_stat_activity: error code %d", ret);
 
 		ash_time=GetCurrentTimestamp();
+		sample_ash = last_ash_sample_time == 0 ||
+			(ash_time - last_ash_sample_time) >=
+			((TimestampTz) ash_sampling_period * USECS_PER_SEC);
 		/* Do some processing */
 
 		if (SPI_processed > 0)
 		{
 			gotactives=true;
-			for (i = 0; i < SPI_processed; i++)
+			if (sample_ash)
 			{
-				bool isnull;
-				Datum data;
-				char *usenamevalue=NULL;
-				char *datnamevalue=NULL;
-				char *appnamevalue=NULL;
-				char *wait_event_typevalue=NULL;
-				char *wait_eventvalue=NULL;
-				char *client_hostnamevalue=NULL;
-				char *queryvalue=NULL;
-				char *backend_typevalue=NULL;
-				char *statevalue=NULL;
-				char *blockerstatevalue=NULL;
-				char *clientaddrvalue=NULL;
-				int pidvalue;
+				last_ash_sample_time = ash_time;
+				for (i = 0; i < SPI_processed; i++)
+				{
+					bool isnull;
+					Datum data;
+					char *usenamevalue=NULL;
+					char *datnamevalue=NULL;
+					char *appnamevalue=NULL;
+					char *wait_event_typevalue=NULL;
+					char *wait_eventvalue=NULL;
+					char *client_hostnamevalue=NULL;
+					char *queryvalue=NULL;
+					char *backend_typevalue=NULL;
+					char *statevalue=NULL;
+					char *blockerstatevalue=NULL;
+					char *clientaddrvalue=NULL;
+					int pidvalue;
 #if PG_VERSION_NUM >= 130000
-				int leader_pidvalue;
+					int leader_pidvalue;
 #endif
-				int client_portvalue;
-				int blockersvalue;
-				int blockerpidvalue;
-				Oid datidvalue;
-				Oid usesysidvalue;
-				TransactionId backend_xminvalue;
-				TransactionId backend_xidvalue;
-				TimestampTz backend_startvalue;
-				TimestampTz xact_startvalue;
-				TimestampTz query_startvalue;
-				TimestampTz state_changevalue;
-				uint64 queryidvalue;
-				char *gpi_queryvalue = NULL;
-				char *cmdtypevalue = NULL;
+					int client_portvalue;
+					int blockersvalue;
+					int blockerpidvalue;
+					Oid datidvalue;
+					Oid usesysidvalue;
+					TransactionId backend_xminvalue;
+					TransactionId backend_xidvalue;
+					TimestampTz backend_startvalue;
+					TimestampTz xact_startvalue;
+					TimestampTz query_startvalue;
+					TimestampTz state_changevalue;
+					uint64 queryidvalue;
+					char *gpi_queryvalue = NULL;
+					char *cmdtypevalue = NULL;
 
-				/* Fetch values */
+					/* Fetch values */
 
 				/* datid */
 				datidvalue = DatumGetObjectId(SPI_getbinval(
@@ -1227,30 +1250,31 @@ letswait:
 #endif
 
 				/* prepare to store the entry */
-				ash_prepare_store(ash_time, pidvalue,
+					ash_prepare_store(ash_time, pidvalue,
 #if PG_VERSION_NUM >= 130000
-									leader_pidvalue,
+										leader_pidvalue,
 #endif
-									usenamevalue ? usenamevalue : "\0",
-									client_portvalue, datidvalue,
-									datnamevalue ? datnamevalue : "\0",
-									appnamevalue ? appnamevalue : "\0",
-									clientaddrvalue ? clientaddrvalue : "\0",
-									backend_xminvalue, backend_startvalue,
-									xact_startvalue,query_startvalue,
-									state_changevalue,
-									wait_event_typevalue ? wait_event_typevalue : "\0",
-									wait_eventvalue ? wait_eventvalue : "\0",
-									statevalue ? statevalue : "\0",
-									client_hostnamevalue ? client_hostnamevalue : "\0",
-									queryvalue ? queryvalue : "\0",
-									backend_typevalue ? backend_typevalue : "\0",
-									usesysidvalue, backend_xidvalue,
-									blockersvalue, blockerpidvalue,
-									blockerstatevalue ? blockerstatevalue : "\0",
-									queryidvalue,
-									gpi_queryvalue ? gpi_queryvalue : "\0",
-									cmdtypevalue ? cmdtypevalue : "\0");
+										usenamevalue ? usenamevalue : "\0",
+										client_portvalue, datidvalue,
+										datnamevalue ? datnamevalue : "\0",
+										appnamevalue ? appnamevalue : "\0",
+										clientaddrvalue ? clientaddrvalue : "\0",
+										backend_xminvalue, backend_startvalue,
+										xact_startvalue,query_startvalue,
+										state_changevalue,
+										wait_event_typevalue ? wait_event_typevalue : "\0",
+										wait_eventvalue ? wait_eventvalue : "\0",
+										statevalue ? statevalue : "\0",
+										client_hostnamevalue ? client_hostnamevalue : "\0",
+										queryvalue ? queryvalue : "\0",
+										backend_typevalue ? backend_typevalue : "\0",
+										usesysidvalue, backend_xidvalue,
+										blockersvalue, blockerpidvalue,
+										blockerstatevalue ? blockerstatevalue : "\0",
+										queryidvalue,
+										gpi_queryvalue ? gpi_queryvalue : "\0",
+										cmdtypevalue ? cmdtypevalue : "\0");
+				}
 			}
 		}
 		SPI_finish();
@@ -1259,8 +1283,13 @@ letswait:
 		pgstat_report_activity(STATE_IDLE, NULL);
 
 		/* pg_stat_statement_history */
-		if (gotactives && pgssh_enable) 
+		if (gotactives && pgssh_enable)
 		{
+			if (last_pgssh_sample_time != 0 &&
+				(ash_time - last_pgssh_sample_time) <
+				((TimestampTz) pgssh_sampling_period * USECS_PER_SEC))
+				goto skip_pgssh_sample;
+
 			SetCurrentStatementStartTimestamp();
 			StartTransactionCommand();
 			SPI_connect();
@@ -1312,7 +1341,9 @@ letswait:
 			PopActiveSnapshot();
 			CommitTransactionCommand();
 			pgstat_report_activity(STATE_IDLE, NULL);
+			last_pgssh_sample_time = ash_time;
 		}
+skip_pgssh_sample:
 		MemoryContextReset(pgsentinel_loop_context);
 	}
 	/* No problems, so clean exit */
@@ -1375,6 +1406,19 @@ pgsentinel_load_params(void)
 							10000,
 							INT_MAX,
 							PGC_POSTMASTER,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pgsentinel_pgssh.sampling_period",
+							"Duration between each pgssh pull (in seconds).",
+							NULL,
+							&pgssh_sampling_period,
+							1,
+							1,
+							INT_MAX,
+							PGC_SIGHUP,
 							0,
 							NULL,
 							NULL,
