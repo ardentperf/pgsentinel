@@ -24,6 +24,7 @@ SELECT pgsentinel_nested_queryid_test();
  
 (1 row)
 
+-- Verify ASH records a distinct nested query ID.
 SELECT CASE WHEN current_setting('server_version_num')::integer >= 160000
        THEN count(*) > 0 ELSE true END AS has_nested_queryid
 FROM pg_active_session_history
@@ -39,6 +40,7 @@ SELECT pgsentinel_nested_queryid_test();
  
 (1 row)
 
+-- Verify pgssh includes both top-level and nested query IDs.
 SELECT CASE WHEN current_setting('server_version_num')::integer >= 160000
        THEN count(DISTINCT h.queryid) = 2 ELSE true END
        AS has_nested_pgssh_queryids
@@ -58,6 +60,7 @@ WHERE h.queryid IN (
 (1 row)
 
 DROP FUNCTION pgsentinel_nested_queryid_test();
+
 select pg_sleep(3);
  pg_sleep 
 ----------
